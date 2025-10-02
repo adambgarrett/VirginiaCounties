@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>VA Counties & Independent Cities</title>
+  <title>VA Localities – Filterable Map</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <style>
     html,body{height:100%;margin:0}
@@ -17,6 +17,10 @@
     .toolbar{display:flex;gap:8px;margin:8px 0 12px}
     .toolbar button{padding:6px 10px;border:1px solid #aaa;background:#fff;border-radius:6px;cursor:pointer}
     .badge{display:inline-block;background:#eee;border-radius:999px;padding:2px 8px;margin-left:6px}
+    .row{display:flex;gap:8px;align-items:center;margin:6px 0}
+    .row input[type="range"]{flex:1}
+    small.mono{font-family:ui-monospace,Consolas,monospace;color:#666}
+    select{width:100%;padding:6px}
   </style>
 </head>
 <body>
@@ -36,10 +40,25 @@
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- Papa Parse to read CSV easily -->
+<script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
 <script>
-const GEOJSON_URL = 'virginia_counties.geojson'; // same folder as index.html
+const GEOJSON_URL = 'virginia_counties.geojson';
+const CSV_URL     = 'locality_data.csv';
 
-const FILTERS = [
+// ---------------- Base Leaflet map ----------------
+const INITIAL_VIEW = [37.7, -78.5], INITIAL_Z = 7;
+const map = L.map('map').setView(INITIAL_VIEW, INITIAL_Z);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap'
+}).addTo(map);
+
+let featureLayer, allFeatures=[], activeFilters={}, selectedGEOIDs=new Set();
+const styles={ match:{weight:1,color:'#333',fillOpacity:0.6}, dim:{weight:0.5,color:'#999',fillOpacity:0.15} };
+
+// ---------------- Filters config (static + dynamic) ----------------
+// Static groups that don't need CSV
+const STATIC_GROUPS = [
   {
     id: 'type', label: 'Type', type: 'checkboxes',
     options: [
@@ -48,29 +67,28 @@ const FILTERS = [
     ],
     get: f => (String(f.properties.lsad)==='25' ? 'Independent City' : 'County')
   },
-  { id: 'nameSearch', label: 'Name contains', type: 'text',
+  {
+    id: 'nameSearch', label: 'Name contains', type: 'text',
     get: f => (f.properties.name || '').toLowerCase(),
     compare: (value, get, f) => get(f).includes(value.trim().toLowerCase())
   }
 ];
 
-const INITIAL_VIEW = [37.7, -78.5], INITIAL_Z = 7;
+// Dynamic groups (built after CSV load so we know ranges and MSA names)
+let DYNAMIC_GROUPS = []; // will be filled later
 
-const map = L.map('map').setView(INITIAL_VIEW, INITIAL_Z);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '&copy; OpenStreetMap'
-}).addTo(map);
-
-let featureLayer, allFeatures=[], activeFilters={}, selectedGEOIDs=new Set();
-
+// ---------------- UI rendering ----------------
 const filtersDiv=document.getElementById('filters');
-function renderFilters(){
+function renderFilters() {
   filtersDiv.innerHTML='';
-  FILTERS.forEach(group=>{
+  const GROUPS = [...STATIC_GROUPS, ...DYNAMIC_GROUPS];
+
+  GROUPS.forEach(group=>{
     const wrap=document.createElement('div'); wrap.className='group';
     const title=document.createElement('h4'); title.textContent=group.label; wrap.appendChild(title);
+
     if(group.type==='checkboxes'){
-      group.options.forEach(opt=>{
+      (group.options||[]).forEach(opt=>{
         const id=`${group.id}_${opt.value}`.replace(/\s+/g,'_');
         const label=document.createElement('label'); label.className='pill';
         label.innerHTML=`<input type="checkbox" id="${id}" data-group="${group.id}" value="${opt.value}">${opt.label}`;
@@ -78,48 +96,93 @@ function renderFilters(){
       });
     } else if(group.type==='text'){
       const input=document.createElement('input');
-      input.type='text'; input.placeholder='e.g., Fairfax'; input.dataset.group=group.id;
+      input.type='text'; input.placeholder=group.placeholder || 'type here';
+      input.dataset.group=group.id;
       input.addEventListener('input', debounce(applyFilters, 200));
       wrap.appendChild(input);
+    } else if(group.type==='range'){
+      const row=document.createElement('div'); row.className='row';
+      const input=document.createElement('input');
+      input.type='range'; input.min=group.min; input.max=group.max; input.step=group.step || 1;
+      input.value=group.defaultValue ?? group.min;
+      input.dataset.group=group.id;
+      const val=document.createElement('div'); val.className='badge'; val.textContent=group.format?group.format(input.value):input.value;
+      input.addEventListener('input', ()=>{ val.textContent=group.format?group.format(input.value):input.value; applyFilters(); });
+      row.appendChild(input); row.appendChild(val); wrap.appendChild(row);
+      const hint=document.createElement('div'); hint.innerHTML=`<small class="mono">min ${group.format?group.format(group.min):group.min} — max ${group.format?group.format(group.max):group.max}</small>`;
+      wrap.appendChild(hint);
+    } else if(group.type==='multiselect'){
+      const sel=document.createElement('select');
+      sel.multiple=true; sel.size=Math.min(8,(group.options||[]).length);
+      (group.options||[]).forEach(opt=>{
+        const o=document.createElement('option'); o.value=opt.value; o.textContent=opt.label||opt.value; sel.appendChild(o);
+      });
+      sel.dataset.group=group.id;
+      sel.addEventListener('change', applyFilters);
+      wrap.appendChild(sel);
     }
     filtersDiv.appendChild(wrap);
   });
 }
-renderFilters();
 
 document.getElementById('btn-reset').onclick=()=>{
-  filtersDiv.querySelectorAll('input').forEach(el=>{ if(el.type==='checkbox') el.checked=false; if(el.type==='text') el.value='';});
+  filtersDiv.querySelectorAll('input,select').forEach(el=>{
+    if(el.type==='checkbox') el.checked=false;
+    else if(el.type==='text') el.value='';
+    else if(el.type==='range') el.value=el.min;
+    else if(el.tagName==='SELECT') Array.from(el.options).forEach(o=>o.selected=false);
+  });
   applyFilters();
 };
 document.getElementById('btn-export').onclick=()=>{
   const ids=Array.from(selectedGEOIDs).sort();
-  const blob=new Blob([ids.join('\\n')],{type:'text/plain'});
+  const blob=new Blob([ids.join('\n')],{type:'text/plain'});
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='va_geoids.txt'; a.click();
 };
 
+// ---------------- Filtering logic ----------------
 function collectFilterState(){
   const s={};
-  FILTERS.forEach(g=>{
-    if(g.type==='checkboxes'){
-      s[g.id]=Array.from(filtersDiv.querySelectorAll(`input[data-group="${g.id}"]:checked`)).map(el=>el.value);
-    } else if(g.type==='text'){
-      const el=filtersDiv.querySelector(`input[data-group="${g.id}"]`); s[g.id]=el.value||'';
+  filtersDiv.querySelectorAll('[data-group]').forEach(el=>{
+    const gid=el.dataset.group;
+    if(el.type==='checkbox'){
+      s[gid]=s[gid]||[];
+      if(el.checked) s[gid].push(el.value);
+    } else if(el.type==='range'){
+      s[gid]=Number(el.value);
+    } else if(el.type==='text'){
+      s[gid]=el.value || '';
+    } else if(el.tagName==='SELECT'){
+      s[gid]=Array.from(el.selectedOptions).map(o=>o.value);
     }
   });
   return s;
 }
+
 function featureMatches(f){
-  for(const g of FILTERS){
-    const value=activeFilters[g.id];
-    const getVal=g.get?g.get:(ff=>ff.properties[g.id]);
+  const GROUPS = [...STATIC_GROUPS, ...DYNAMIC_GROUPS];
+  for(const g of GROUPS){
+    const value = activeFilters[g.id];
+    const getVal = g.get ? g.get : (ff => ff.properties[g.id]);
+
     if(g.type==='checkboxes'){
       if(value && value.length){ if(!value.includes(getVal(f))) return false; }
     } else if(g.type==='text'){
-      if(value && value.trim() && !g.compare(value,getVal,f)) return false;
+      if(value && value.trim() && !g.compare(value, getVal, f)) return false;
+    } else if(g.type==='range'){
+      if (typeof value === 'number' && g.compare){
+        if(!g.compare(value, getVal, f)) return false;
+      }
+    } else if(g.type==='multiselect'){
+      if(value && value.length){
+        const v = getVal(f);
+        if(!value.includes(v)) return false;
+      }
     }
   }
   return true;
 }
+
 const countSpan=document.getElementById('count');
 function applyFilters(){
   activeFilters=collectFilterState();
@@ -128,28 +191,141 @@ function applyFilters(){
     const f=layer.feature;
     const match=featureMatches(f);
     layer.setStyle(match?styles.match:styles.dim);
-    if(match) selectedGEOIDs.add(String(f.properties.geoid || f.properties.GEOID || ''));
+    if(match) selectedGEOIDs.add(String(f.properties.geoid));
   });
   countSpan.textContent=`${selectedGEOIDs.size} selected`;
 }
-const styles={ match:{weight:1,color:'#333',fillOpacity:0.6}, dim:{weight:0.5,color:'#999',fillOpacity:0.15} };
 
-fetch(GEOJSON_URL).then(r=>r.json()).then(geojson=>{
-  allFeatures=geojson.features.map(f=>{
-    f.properties.lsad=String(f.properties.lsad ?? '');
-    f.properties.geoid=String(f.properties.geoid ?? f.properties.GEOID ?? '');
-    f.properties.name=f.properties.name ?? f.properties.NAME ?? '';
+// ---------------- Data load & client-side join ----------------
+Promise.all([
+  fetch(GEOJSON_URL).then(r=>r.json()),
+  fetch(CSV_URL).then(r=>r.text())
+]).then(([geojson, csvText])=>{
+  // parse CSV
+  const parsed = Papa.parse(csvText, { header:true, dynamicTyping:true, skipEmptyLines:true });
+  const byId = new Map();
+  parsed.data.forEach(row=>{
+    const id=String(row.geoid || '').padStart(5,'0');
+    byId.set(id, row);
+  });
+
+  // augment features from CSV
+  allFeatures = geojson.features.map(f=>{
+    f.properties.lsad   = String(f.properties.lsad ?? '');
+    f.properties.geoid  = String(f.properties.geoid ?? f.properties.GEOID ?? '').padStart(5,'0');
+    f.properties.name   = f.properties.name ?? f.properties.NAME ?? '';
+    const extra = byId.get(f.properties.geoid);
+    if(extra){
+      f.properties.pop_density                  = Number(extra.pop_density);
+      f.properties.pop_growth_10yr              = Number(extra.pop_growth_10yr);
+      f.properties.real_estate_tax_min          = Number(extra.real_estate_tax_min);
+      f.properties.real_estate_tax_max          = Number(extra.real_estate_tax_max);
+      f.properties.msa_name                     = (extra.msa_name||'').toString();
+      f.properties.msa_type                     = (extra.msa_type||'None').toString();
+      f.properties.personal_property_tax_rate   = Number(extra.personal_property_tax_rate);
+    } else {
+      // default fallbacks
+      f.properties.msa_type = f.properties.msa_type || 'None';
+      f.properties.msa_name = f.properties.msa_name || '(none)';
+    }
     return f;
   });
-  featureLayer=L.geoJSON({type:'FeatureCollection',features:allFeatures},{
-    style:styles.match,
-    onEachFeature:(f,layer)=>layer.bindTooltip(`${f.properties.name} (${f.properties.lsad==='25'?'Independent City':'County'})`,{sticky:true})
+
+  // Build dynamic filter groups from actual data ranges / unique values
+  const nums = (field) => allFeatures.map(f=>f.properties[field]).filter(v=>Number.isFinite(v));
+  const minmax = field => {
+    const arr = nums(field); return arr.length ? [Math.min(...arr), Math.max(...arr)] : [0,0];
+  };
+  const [pdMin,pdMax]     = minmax('pop_density');
+  const [pgMin,pgMax]     = minmax('pop_growth_10yr');
+  const [rtMinMin,rtMinMax] = minmax('real_estate_tax_min');
+  const [rtMaxMin,rtMaxMax] = minmax('real_estate_tax_max');
+  const [ppMin,ppMax]     = minmax('personal_property_tax_rate');
+
+  const uniqueMSAtypes = Array.from(new Set(allFeatures.map(f=>f.properties.msa_type || 'None'))).sort();
+  const uniqueMSAnames = Array.from(new Set(allFeatures.map(f=>f.properties.msa_name || '(none)'))).sort();
+
+  // define dynamic groups
+  DYNAMIC_GROUPS = [
+    {
+      id:'pop_density', label:'Min population density (per km²)', type:'range',
+      min: Math.floor(pdMin), max: Math.ceil(pdMax), step: 1, defaultValue: Math.floor(pdMin),
+      get: f=> f.properties.pop_density,
+      compare: (value, get, f)=> Number.isFinite(get(f)) ? get(f) >= value : false
+    },
+    {
+      id:'pop_growth_10yr', label:'Min population growth (10y, %)', type:'range',
+      min: Math.floor(pgMin), max: Math.ceil(pgMax), step: 1, defaultValue: Math.floor(pgMin),
+      get: f=> f.properties.pop_growth_10yr,
+      compare: (value, get, f)=> Number.isFinite(get(f)) ? get(f) >= value : false,
+      format: v=> `${Number(v).toFixed(0)}%`
+    },
+    {
+      id:'real_estate_tax_min', label:'Min real estate tax MIN (rate)', type:'range',
+      min: +(rtMinMin.toFixed(4)), max: +(rtMinMax.toFixed(4)), step: 0.0001, defaultValue: +(rtMinMin.toFixed(4)),
+      get: f=> f.properties.real_estate_tax_min,
+      compare: (value, get, f)=> Number.isFinite(get(f)) ? get(f) >= value : false,
+      format: v=> `${(Number(v)*100).toFixed(2)}%`
+    },
+    {
+      id:'real_estate_tax_max', label:'Min real estate tax MAX (rate)', type:'range',
+      min: +(rtMaxMin.toFixed(4)), max: +(rtMaxMax.toFixed(4)), step: 0.0001, defaultValue: +(rtMaxMin.toFixed(4)),
+      get: f=> f.properties.real_estate_tax_max,
+      compare: (value, get, f)=> Number.isFinite(get(f)) ? get(f) >= value : false,
+      format: v=> `${(Number(v)*100).toFixed(2)}%`
+    },
+    {
+      id:'personal_property_tax_rate', label:'Min personal property tax (rate)', type:'range',
+      min: +(ppMin.toFixed(3)), max: +(ppMax.toFixed(3)), step: 0.0005, defaultValue: +(ppMin.toFixed(3)),
+      get: f=> f.properties.personal_property_tax_rate,
+      compare: (value, get, f)=> Number.isFinite(get(f)) ? get(f) >= value : false,
+      format: v=> `${(Number(v)*100).toFixed(2)}%`
+    },
+    {
+      id:'msa_type', label:'MSA type', type:'checkboxes',
+      options: uniqueMSAtypes.map(v=>({value:v, label:v}))
+        // common pattern: enforce label casing
+    },
+    {
+      id:'msa_name', label:'MSA name(s)', type:'multiselect',
+      options: uniqueMSAnames.map(v=>({value:v, label:v})),
+      get: f=> f.properties.msa_name
+    }
+  ];
+
+  // render sidebar with all groups
+  renderFilters();
+
+  // add layer
+  featureLayer = L.geoJSON({type:'FeatureCollection', features: allFeatures},{
+    style: styles.match,
+    onEachFeature: (f, layer) => {
+      const t = (String(f.properties.lsad)==='25') ? 'Independent City' : 'County';
+      const dens = Number.isFinite(f.properties.pop_density) ? `${f.properties.pop_density.toFixed(0)} /km²` : '–';
+      const grow = Number.isFinite(f.properties.pop_growth_10yr) ? `${f.properties.pop_growth_10yr.toFixed(1)}%` : '–';
+      const reMin = Number.isFinite(f.properties.real_estate_tax_min) ? `${(f.properties.real_estate_tax_min*100).toFixed(2)}%` : '–';
+      const reMax = Number.isFinite(f.properties.real_estate_tax_max) ? `${(f.properties.real_estate_tax_max*100).toFixed(2)}%` : '–';
+      const pp    = Number.isFinite(f.properties.personal_property_tax_rate) ? `${(f.properties.personal_property_tax_rate*100).toFixed(2)}%` : '–';
+      const msa   = (f.properties.msa_name && f.properties.msa_name!=='(none)') ? `${f.properties.msa_name} (${f.properties.msa_type})` : 'None';
+      layer.bindPopup(
+        `<b>${f.properties.name}</b> (${t})<br>
+         GEOID: ${f.properties.geoid}<br>
+         Pop density: ${dens}<br>
+         10y growth: ${grow}<br>
+         Real estate tax: min ${reMin}, max ${reMax}<br>
+         Personal property tax: ${pp}<br>
+         MSA: ${msa}`
+      );
+    }
   }).addTo(map);
+
   map.fitBounds(featureLayer.getBounds(),{padding:[20,20]});
   applyFilters();
 });
 
-function debounce(fn,ms=150){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);} }
+// ---------------- utils ----------------
+function debounce(fn,ms=150){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a),ms); }; }
 </script>
 </body>
 </html>
+
