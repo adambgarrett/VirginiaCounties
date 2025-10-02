@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VA Counties & Independent Cities</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html,body{height:100%;margin:0}
+    #app{display:flex;height:100%}
+    #sidebar{width:360px;max-width:100%;border-right:1px solid #ddd;padding:14px;overflow:auto;font:14px/1.35 system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    #map{flex:1}
+    .group{margin-bottom:16px}
+    .group h4{margin:12px 0 8px;font-size:14px}
+    .pill{display:inline-block;margin:4px 6px 0 0}
+    .pill input{margin-right:4px}
+    .toolbar{display:flex;gap:8px;margin:8px 0 12px}
+    .toolbar button{padding:6px 10px;border:1px solid #aaa;background:#fff;border-radius:6px;cursor:pointer}
+    .badge{display:inline-block;background:#eee;border-radius:999px;padding:2px 8px;margin-left:6px}
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="sidebar">
+    <h3 style="margin:0 0 6px">Virginia Localities</h3>
+    <div style="color:#666;margin-bottom:10px">
+      Filter counties & independent cities. <span id="count" class="badge">0 selected</span>
+    </div>
+    <div class="toolbar">
+      <button id="btn-reset">Reset</button>
+      <button id="btn-export">Export GEOIDs</button>
+    </div>
+    <div id="filters"></div>
+  </div>
+  <div id="map"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const GEOJSON_URL = 'virginia_counties.geojson'; // same folder as index.html
+
+const FILTERS = [
+  {
+    id: 'type', label: 'Type', type: 'checkboxes',
+    options: [
+      { value: 'County', label: 'Counties (LSAD 06)' },
+      { value: 'Independent City', label: 'Independent Cities (LSAD 25)' },
+    ],
+    get: f => (String(f.properties.lsad)==='25' ? 'Independent City' : 'County')
+  },
+  { id: 'nameSearch', label: 'Name contains', type: 'text',
+    get: f => (f.properties.name || '').toLowerCase(),
+    compare: (value, get, f) => get(f).includes(value.trim().toLowerCase())
+  }
+];
+
+const INITIAL_VIEW = [37.7, -78.5], INITIAL_Z = 7;
+
+const map = L.map('map').setView(INITIAL_VIEW, INITIAL_Z);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap'
+}).addTo(map);
+
+let featureLayer, allFeatures=[], activeFilters={}, selectedGEOIDs=new Set();
+
+const filtersDiv=document.getElementById('filters');
+function renderFilters(){
+  filtersDiv.innerHTML='';
+  FILTERS.forEach(group=>{
+    const wrap=document.createElement('div'); wrap.className='group';
+    const title=document.createElement('h4'); title.textContent=group.label; wrap.appendChild(title);
+    if(group.type==='checkboxes'){
+      group.options.forEach(opt=>{
+        const id=`${group.id}_${opt.value}`.replace(/\s+/g,'_');
+        const label=document.createElement('label'); label.className='pill';
+        label.innerHTML=`<input type="checkbox" id="${id}" data-group="${group.id}" value="${opt.value}">${opt.label}`;
+        wrap.appendChild(label);
+      });
+    } else if(group.type==='text'){
+      const input=document.createElement('input');
+      input.type='text'; input.placeholder='e.g., Fairfax'; input.dataset.group=group.id;
+      input.addEventListener('input', debounce(applyFilters, 200));
+      wrap.appendChild(input);
+    }
+    filtersDiv.appendChild(wrap);
+  });
+}
+renderFilters();
+
+document.getElementById('btn-reset').onclick=()=>{
+  filtersDiv.querySelectorAll('input').forEach(el=>{ if(el.type==='checkbox') el.checked=false; if(el.type==='text') el.value='';});
+  applyFilters();
+};
+document.getElementById('btn-export').onclick=()=>{
+  const ids=Array.from(selectedGEOIDs).sort();
+  const blob=new Blob([ids.join('\\n')],{type:'text/plain'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='va_geoids.txt'; a.click();
+};
+
+function collectFilterState(){
+  const s={};
+  FILTERS.forEach(g=>{
+    if(g.type==='checkboxes'){
+      s[g.id]=Array.from(filtersDiv.querySelectorAll(`input[data-group="${g.id}"]:checked`)).map(el=>el.value);
+    } else if(g.type==='text'){
+      const el=filtersDiv.querySelector(`input[data-group="${g.id}"]`); s[g.id]=el.value||'';
+    }
+  });
+  return s;
+}
+function featureMatches(f){
+  for(const g of FILTERS){
+    const value=activeFilters[g.id];
+    const getVal=g.get?g.get:(ff=>ff.properties[g.id]);
+    if(g.type==='checkboxes'){
+      if(value && value.length){ if(!value.includes(getVal(f))) return false; }
+    } else if(g.type==='text'){
+      if(value && value.trim() && !g.compare(value,getVal,f)) return false;
+    }
+  }
+  return true;
+}
+const countSpan=document.getElementById('count');
+function applyFilters(){
+  activeFilters=collectFilterState();
+  selectedGEOIDs.clear();
+  featureLayer.eachLayer(layer=>{
+    const f=layer.feature;
+    const match=featureMatches(f);
+    layer.setStyle(match?styles.match:styles.dim);
+    if(match) selectedGEOIDs.add(String(f.properties.geoid || f.properties.GEOID || ''));
+  });
+  countSpan.textContent=`${selectedGEOIDs.size} selected`;
+}
+const styles={ match:{weight:1,color:'#333',fillOpacity:0.6}, dim:{weight:0.5,color:'#999',fillOpacity:0.15} };
+
+fetch(GEOJSON_URL).then(r=>r.json()).then(geojson=>{
+  allFeatures=geojson.features.map(f=>{
+    f.properties.lsad=String(f.properties.lsad ?? '');
+    f.properties.geoid=String(f.properties.geoid ?? f.properties.GEOID ?? '');
+    f.properties.name=f.properties.name ?? f.properties.NAME ?? '';
+    return f;
+  });
+  featureLayer=L.geoJSON({type:'FeatureCollection',features:allFeatures},{
+    style:styles.match,
+    onEachFeature:(f,layer)=>layer.bindTooltip(`${f.properties.name} (${f.properties.lsad==='25'?'Independent City':'County'})`,{sticky:true})
+  }).addTo(map);
+  map.fitBounds(featureLayer.getBounds(),{padding:[20,20]});
+  applyFilters();
+});
+
+function debounce(fn,ms=150){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);} }
+</script>
+</body>
+</html>
