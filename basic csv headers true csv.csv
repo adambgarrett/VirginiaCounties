@@ -1,0 +1,4 @@
+﻿"geoid,pop_density,pop_growth_10yr,real_estate_tax_min,real_estate_tax_max,msa_name,msa_type,personal_property_tax_rate"
+"51013,415.2,3.8,0.0065,0.0080,Washington-Arlington-Alexandria,Metro,0.035"
+"51830,1704.1,2.4,0.0064,0.0064,Virginia Beach-Norfolk-Newport News,Metro,0.035"
+"51015,45.7,-1.2,0.0052,0.0052,(none),None,0.033"
